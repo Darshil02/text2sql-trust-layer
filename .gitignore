@@ -16,4 +16,4 @@ wheels/
 *.duckdb
 chroma_db/
 .DS_Store
-data/*.csv
+data/**/*.csv
