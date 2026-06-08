@@ -283,6 +283,8 @@ The trustworthy signals for wrong-column errors are the semantic checks:
 
 **On SQL non-determinism:** The generator is non-deterministic across runs. For the Q6 question ("What is the average number of items per order?"), the agent has been observed generating both `SELECT AVG(order_item_id) FROM order_items` (no GROUP BY) and `SELECT AVG(order_item_id) AS average_items_per_order FROM order_items GROUP BY order_id` (with GROUP BY). Both are wrong for the same underlying reason — wrong column — and both are caught by the semantic checks regardless of the GROUP BY variant. The trust layer is robust to this variation because it reasons about the column choice, not the query structure.
 
+The same non-determinism applies to the join itself: for "total payment value per product category" the agent produces a fan-out inflated by 27% ($20.3M) on one run and 25% ($20.0M, routed through the category-translation table) on another — a different wrong query each time, which is itself an argument for runtime verification, since you cannot predict in advance which wrong query a given run will produce.
+
 ---
 
 ## Known limitation: semantic column-meaning errors

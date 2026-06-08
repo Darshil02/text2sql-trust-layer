@@ -1,0 +1,155 @@
+[
+  {
+    "id": "fanout",
+    "label": "Fan-out double-count \u2192 ABSTAIN (flagship)",
+    "question": "What is the total payment value per product category?",
+    "sql": "SELECT T1.product_category_name, SUM(T4.payment_value) AS total_payment_value FROM products AS T1 JOIN order_items AS T2 ON T1.product_id = T2.product_id JOIN orders AS T3 ON T2.order_id = T3.order_id JOIN order_payments AS T4 ON T3.order_id = T4.order_id GROUP BY T1.product_category_name",
+    "result_preview": [
+      [
+        "utilidades_domesticas",
+        1094758.129999997
+      ],
+      [
+        "cama_mesa_banho",
+        1712553.6700000037
+      ],
+      [
+        "moveis_escritorio",
+        646826.4900000001
+      ],
+      [
+        "brinquedos",
+        619037.6899999983
+      ],
+      [
+        "moveis_cozinha_area_de_servico_jantar_e_jardim",
+        74660.97999999998
+      ],
+      [
+        "artes",
+        30992.92999999999
+      ],
+      [
+        "casa_construcao",
+        136645.28999999992
+      ],
+      [
+        "cine_foto",
+        9530.32
+      ]
+    ],
+    "result_rows": 74,
+    "verdict": "ABSTAIN",
+    "confidence": 0.1,
+    "reasoning": "Not answering because: [reexec] original total 20,308,134.71 exceeds grain-corrected baseline 16,008,872.12 by 26.9% \u2014 fan-out inflation confirmed; [llm_judge] SQL does not answer the question: payment_value aggregated at order-item grain causing double-counting; incorrect join multiplicity leads to overestimation. Also flagged (soft): [ast] SUM(T4.payment_value) aggregates a column from 'order_payments', which is on the many-side of a join \u2014 the aggregate will be inflated by the join fan-out.",
+    "checks_fired": [
+      "ast",
+      "llm_judge",
+      "reexec"
+    ],
+    "trust_answer": "This question cannot be answered with confidence.\n\nNot answering because: [reexec] original total 20,308,134.71 exceeds grain-corrected baseline 16,008,872.12 by 26.9% \u2014 fan-out inflation confirmed; [llm_judge] SQL does not answer the question: payment_value aggregated at order-item grain causing double-counting; incorrect join multiplicity leads to overestimation. Also flagged (soft): [ast] SUM(T4.payment_value) aggregates a column from 'order_payments', which is on the many-side of a join \u2014 the aggregate will be inflated by the join fan-out.",
+    "naive_answer": "The total payment value per product category ranges from 10042.93 for tablets_impressao_imagem to 1712553.67 for cama_mesa_banho, with 74 different categories and a category with no name having a total payment value of 252801.71.",
+    "correct_answer": "\u2248$16.0M total (deduplicate payments to one row per order before joining)",
+    "error_magnitude": "\u2248$20.3M shown across categories vs \u2248$16.0M correct \u2014 27% inflated by join fan-out"
+  },
+  {
+    "id": "wrong_column",
+    "label": "Wrong-column aggregation \u2192 ABSTAIN (semantic catch)",
+    "question": "What is the average number of items per order?",
+    "sql": "SELECT AVG(order_item_id) AS average_items_per_order FROM order_items",
+    "result_preview": [
+      [
+        1.1978339991122948
+      ]
+    ],
+    "result_rows": 1,
+    "verdict": "ABSTAIN",
+    "confidence": 0.0,
+    "reasoning": "Not answering because: [reexec] raw AVG(order_item_id) = 1.1978 vs grain-corrected AVG(SUM per orders.order_id) = 1.3676 \u2014 differ by -12.4%, wrong grain confirmed; [llm_judge] SQL does not answer the question: Aggregating wrong column (order_item_id) instead of counting items per order; Missing grouping by order_id to compute per-order item count; Using surrogate key for average is semantically meaningless; [consensus] values differ: original 1.1978 vs re-derived 1.1417 (4.7% apart) \u2014 consensus low. Also flagged (soft): [ast] AVG(order_item_id) is computed at 'order_items' row grain (detected: order_items.order_id is a FK to 'orders' with fan-out ratio > 1.01). Result is row-weighted, not orders-weighted. Pre-aggregate to 'orders' grain before applying AVG..",
+    "checks_fired": [
+      "ast",
+      "consensus",
+      "llm_judge",
+      "reexec"
+    ],
+    "trust_answer": "This question cannot be answered with confidence.\n\nNot answering because: [reexec] raw AVG(order_item_id) = 1.1978 vs grain-corrected AVG(SUM per orders.order_id) = 1.3676 \u2014 differ by -12.4%, wrong grain confirmed; [llm_judge] SQL does not answer the question: Aggregating wrong column (order_item_id) instead of counting items per order; Missing grouping by order_id to compute per-order item count; Using surrogate key for average is semantically meaningless; [consensus] values differ: original 1.1978 vs re-derived 1.1417 (4.7% apart) \u2014 consensus low. Also flagged (soft): [ast] AVG(order_item_id) is computed at 'order_items' row grain (detected: order_items.order_id is a FK to 'orders' with fan-out ratio > 1.01). Result is row-weighted, not orders-weighted. Pre-aggregate to 'orders' grain before applying AVG..",
+    "naive_answer": "The average number of items per order is 1.198.",
+    "correct_answer": "1.1417 items per order (COUNT(*) per order, then AVG)",
+    "error_magnitude": "naive 1.1978 vs correct 1.1417 \u2014 the query averages order_item_id, a positional counter, not the item count"
+  },
+  {
+    "id": "clean_count",
+    "label": "Clean \u2192 ANSWER",
+    "question": "How many orders are there?",
+    "sql": "SELECT COUNT(order_id) FROM orders",
+    "result_preview": [
+      [
+        99441
+      ]
+    ],
+    "result_rows": 1,
+    "verdict": "ANSWER",
+    "confidence": 1.0,
+    "reasoning": "All checks passed.",
+    "checks_fired": [],
+    "trust_answer": "There are 99441 orders.",
+    "naive_answer": "There are 99441 orders."
+  },
+  {
+    "id": "clean_paytype",
+    "label": "Clean, but soft status FLAG",
+    "question": "What is the total revenue by payment type?",
+    "sql": "SELECT payment_type, SUM(payment_value) AS total_revenue FROM order_payments GROUP BY payment_type",
+    "result_preview": [
+      [
+        "boleto",
+        2869361.2699999753
+      ],
+      [
+        "voucher",
+        379436.8700000007
+      ],
+      [
+        "debit_card",
+        217989.7900000001
+      ],
+      [
+        "not_defined",
+        0.0
+      ],
+      [
+        "credit_card",
+        12542084.189999327
+      ]
+    ],
+    "result_rows": 5,
+    "verdict": "FLAG",
+    "confidence": 0.9,
+    "reasoning": "Answer provided with caveats: [status] aggregate on 'order_payments' has unconstrained status-like column(s): ['order_payments.payment_type (5 distinct values)']. Result may include rows with unintended status values (e.g. cancelled, pending)..",
+    "checks_fired": [
+      "status"
+    ],
+    "trust_answer": "The total revenue by payment type is as follows: boleto is 2869361.27, voucher is 379436.87, debit_card is 217989.79, not_defined is 0, and credit_card is 12542084.19.\n\nCaveat: Answer provided with caveats: [status] aggregate on 'order_payments' has unconstrained status-like column(s): ['order_payments.payment_type (5 distinct values)']. Result may include rows with unintended status values (e.g. cancelled, pending)..",
+    "naive_answer": "The total revenue by payment type is as follows: boleto is approximately 2869361, voucher is approximately 379437, debit_card is approximately 217990, not_defined is 0, and credit_card is approximately 12542084."
+  },
+  {
+    "id": "known_limitation",
+    "label": "Known limitation \u2192 ANSWER (the honest miss)",
+    "question": "How many distinct customers are there?",
+    "sql": "SELECT COUNT(DISTINCT customer_id) FROM customers",
+    "result_preview": [
+      [
+        99441
+      ]
+    ],
+    "result_rows": 1,
+    "verdict": "ANSWER",
+    "confidence": 1.0,
+    "reasoning": "All checks passed.",
+    "checks_fired": [],
+    "trust_answer": "There are 99441 distinct customers.",
+    "naive_answer": "There are 99441 distinct customers.",
+    "correct_answer": "96,096 distinct customers (via customer_unique_id)",
+    "error_magnitude": "99,441 shown vs 96,096 correct \u2014 customer_id is assigned per order, not per person; the right column is customer_unique_id"
+  }
+]
