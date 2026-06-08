@@ -100,8 +100,36 @@ def node_run_trust_layer(state: AgentState) -> dict:
 
         if not structural_hard:
             # ── F2: sanity ─────────────────────────────────────────────────
-            checks.append(detect_fanout_ast(sql, con))
-            checks.append(detect_fanout_reexec(sql, con))
+            fanout_ast = detect_fanout_ast(sql, con)
+            fanout_reexec = detect_fanout_reexec(sql, con)
+
+            # AST fan-out is an advisory heuristic; reexec is the empirical confirmer.
+            # When reexec actually ran the comparison (it carries original_value /
+            # corrected_value) and found NO inflation, the AST "possible fan-out"
+            # advisory is redundant noise — defer to the empirical result and suppress
+            # it. We do NOT suppress when reexec errored or could-not-verify (those
+            # results lack the value keys), so a genuine but unmeasured fan-out still
+            # surfaces the advisory.
+            reexec_measured_clean = (
+                not fanout_reexec.get("flagged")
+                and "original_value" in fanout_reexec
+                and "corrected_value" in fanout_reexec
+            )
+            if reexec_measured_clean and fanout_ast.get("flagged"):
+                fanout_ast = {
+                    **fanout_ast,
+                    "flagged": False,
+                    "suppressed_by": "reexec",
+                    "reason": (
+                        f"AST fan-out advisory suppressed — reexec empirically cleared this "
+                        f"query (original {fanout_reexec['original_value']:,.2f} vs grain-corrected "
+                        f"baseline {fanout_reexec['corrected_value']:,.2f}, no inflation). "
+                        f"Advisory was: {fanout_ast.get('reason', '')}"
+                    ),
+                }
+
+            checks.append(fanout_ast)
+            checks.append(fanout_reexec)
             checks.append(detect_wrong_grain_ast(sql, con))
             checks.append(detect_wrong_grain_reexec(sql, con))
             checks.append(check_missing_temporal_filter(question, sql, con))
