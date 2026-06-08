@@ -41,6 +41,10 @@ def check_schema_exists(sql: str, con) -> dict[str, Any]:
         referenced anywhere in the query; flagged only if absent from every one.
       - Columns referencing a missing table are skipped (the table is already flagged).
       - Subquery-derived aliases that resolve to no real table are skipped.
+      - Derived names the query introduces are valid and never flagged: CTE names
+        and subquery aliases (derived tables), and explicit SELECT-list aliases
+        like `COUNT(x) AS n` (derived columns). Bare column projections are still
+        validated, so a genuinely missing column still flags.
       - SELECT * and positional GROUP BY (GROUP BY 1) are not checked.
 
     Returns:
@@ -61,8 +65,32 @@ def check_schema_exists(sql: str, con) -> dict[str, Any]:
         }
 
     # -----------------------------------------------------------------------
+    # 0. Collect names the query INTRODUCES itself — valid to reference even
+    #    though they are not in the base schema, and must not be reported as
+    #    hallucinations:
+    #      - derived TABLES:  CTE names and subquery aliases
+    #      - derived COLUMNS: explicit SELECT-list aliases (`expr AS name`)
+    #    Bare column projections are NOT treated as derived, so a genuinely
+    #    missing column (e.g. SELECT customer_name FROM orders) still flags.
+    # -----------------------------------------------------------------------
+    derived_tables: set[str] = set()
+    for cte in ast.find_all(exp.CTE):
+        if cte.alias:
+            derived_tables.add(cte.alias)
+    for sub in ast.find_all(exp.Subquery):
+        if sub.alias:
+            derived_tables.add(sub.alias)
+
+    derived_columns: set[str] = set()
+    for sel in ast.find_all(exp.Select):
+        for proj in sel.expressions:
+            if isinstance(proj, exp.Alias) and proj.alias:
+                derived_columns.add(proj.alias)
+
+    # -----------------------------------------------------------------------
     # 1. Collect all Table nodes (recurses into subqueries) and build alias map.
-    #    Simultaneously flag any table not in the real schema.
+    #    Flag any base-table reference not in the real schema; skip references to
+    #    CTEs / derived tables the query produced.
     # -----------------------------------------------------------------------
     alias_to_real: dict[str, str] = {}   # alias_or_name -> real table name
     referenced_real_tables: set[str] = set()
@@ -70,7 +98,7 @@ def check_schema_exists(sql: str, con) -> dict[str, Any]:
 
     for tbl in ast.find_all(exp.Table):
         real_name = tbl.name
-        if not real_name:
+        if not real_name or real_name in derived_tables:
             continue
         alias = tbl.alias or real_name
         alias_to_real[alias] = real_name
@@ -82,7 +110,8 @@ def check_schema_exists(sql: str, con) -> dict[str, Any]:
             referenced_real_tables.add(real_name)
 
     # -----------------------------------------------------------------------
-    # 2. Check every Column node.
+    # 2. Check every Column node. Derived columns (SELECT aliases) are valid
+    #    identifiers regardless of qualification, so skip them up front.
     # -----------------------------------------------------------------------
     missing_columns_set: set[str] = set()
 
@@ -90,14 +119,14 @@ def check_schema_exists(sql: str, con) -> dict[str, Any]:
         col_name = col.name
         t_qualifier = col.table   # table alias or name prefix; empty string if absent
 
-        if not col_name:
+        if not col_name or col_name in derived_columns:
             continue
 
         if t_qualifier:
             # Qualified: resolve the alias to a real table name.
             real_table = alias_to_real.get(t_qualifier)
             if real_table is None:
-                # Unknown alias — likely a subquery alias; skip.
+                # Unknown alias — likely a subquery/CTE alias; skip.
                 continue
             if real_table not in real_table_names:
                 # Table itself is missing; already flagged, skip column.
