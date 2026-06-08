@@ -282,3 +282,37 @@ The trustworthy signals for wrong-column errors are the semantic checks:
 **The correct verdict survives because the checks are independent.** The re-execution detector fired on noisy grounds; the judge and consensus checks fired on solid grounds. Aggregating their outputs with `aggregate_verdict` produces ABSTAIN regardless of which individual signal is reliable. This is the core argument for layering multiple independent checks across structural, sanity, and semantic families: no single check needs to be right for the right reason — the verdict only requires that at least one hard check fires, and two of the three did so here for sound reasons.
 
 **On SQL non-determinism:** The generator is non-deterministic across runs. For the Q6 question ("What is the average number of items per order?"), the agent has been observed generating both `SELECT AVG(order_item_id) FROM order_items` (no GROUP BY) and `SELECT AVG(order_item_id) AS average_items_per_order FROM order_items GROUP BY order_id` (with GROUP BY). Both are wrong for the same underlying reason — wrong column — and both are caught by the semantic checks regardless of the GROUP BY variant. The trust layer is robust to this variation because it reasons about the column choice, not the query structure.
+
+---
+
+## Known limitation: semantic column-meaning errors
+
+The evaluation harness surfaced a failure the trust layer does not catch. (This is eval case `q6` in `eval/questions.py` — "How many distinct customers are there?" — distinct from the "Q6" baseline question on average items per order referenced above; the shared number is coincidental.)
+
+**The error.** Asked "how many distinct customers are there?", the agent generated:
+
+```sql
+SELECT COUNT(DISTINCT customer_id) FROM customers
+```
+
+This returns **99,441**. The correct answer is **96,096**, obtained via:
+
+```sql
+SELECT COUNT(DISTINCT customer_unique_id) FROM customers
+```
+
+The discrepancy is a property of the Olist schema: `customer_id` is assigned fresh for every order, so it is effectively a per-transaction identifier, while `customer_unique_id` is the stable per-person identifier. Counting distinct `customer_id` counts orders-with-a-customer, not distinct customers. The 3,345-customer gap is exactly the set of repeat buyers.
+
+**Why no check caught it.** The query is structurally impeccable:
+
+- **Structural (F1):** `customer_id` is a real column on a real table. No hallucination. Passes.
+- **Sanity (F2):** No join, so no fan-out. No AVG/SUM at a child grain, so no wrong-grain flag. `COUNT(DISTINCT ...)` is the correct idiom for a distinctness question, so nothing structural is amiss. Passes.
+- **Semantic (F3):** The independent LLM judge accepted `COUNT(DISTINCT customer_id)` as a plausible way to answer "how many distinct customers" — `customer_id` *looks* like the right column by name. Consensus did not fire either, because an independent model asked the same question tends to reach for the same plausible-looking column. Both passed.
+
+The verdict was **ANSWER** with full confidence — a false negative.
+
+**Why this is a boundary, not a bug.** Every check in this system reasons about *structure*: does the schema contain this name, does this join multiply rows, is this aggregate at the right grain, is this column a sensible thing to average. None of those questions can distinguish `customer_id` from `customer_unique_id`, because the distinction is not structural — it is a fact about what the data *means* in the real world. `customer_id` being per-order rather than per-person is domain knowledge encoded nowhere in the column types, cardinalities, or query shape that structure-based verification can inspect. Both columns are high-cardinality VARCHARs; both are valid arguments to `COUNT(DISTINCT)`.
+
+This defines a boundary of the approach: **structure-based verification cannot catch errors that require real-world knowledge of what a column actually represents** — for example, an identifier that is per-transaction rather than per-entity. Catching this class would require an external signal the current system does not have: curated column-semantics metadata (a data dictionary noting that `customer_id` is per-order), entity-resolution heuristics, or a judge primed with dataset-specific documentation. Absent that, the honest behavior is to acknowledge the gap rather than to claim coverage the checks do not provide.
+
+This is a documented limitation, not a defect in any individual detector. It marks where structural trust-checking ends and data-dictionary / domain-knowledge verification would have to begin.
