@@ -316,3 +316,11 @@ The verdict was **ANSWER** with full confidence — a false negative.
 This defines a boundary of the approach: **structure-based verification cannot catch errors that require real-world knowledge of what a column actually represents** — for example, an identifier that is per-transaction rather than per-entity. Catching this class would require an external signal the current system does not have: curated column-semantics metadata (a data dictionary noting that `customer_id` is per-order), entity-resolution heuristics, or a judge primed with dataset-specific documentation. Absent that, the honest behavior is to acknowledge the gap rather than to claim coverage the checks do not provide.
 
 This is a documented limitation, not a defect in any individual detector. It marks where structural trust-checking ends and data-dictionary / domain-knowledge verification would have to begin.
+
+---
+
+## F2 filter checks: temporal & status (`trust/sanity.py`)
+
+Soft advisory checks that flag a likely-missing predicate: `check_missing_temporal_filter` (question is time-scoped but the SQL has no DATE/TIMESTAMP predicate) and `check_unconstrained_status` (an aggregate over a low-cardinality status-like column with no WHERE filter). Both emit FLAG-level (soft) signals, not ABSTAIN.
+
+Known soft false-positive (eval c2): the status check caveats a correct `SUM(payment_value)` for not constraining `payment_type`. Kept intentionally — it is a tolerable soft caveat (not a refusal) and the check catches genuine status-omission errors; tuning it to clear this case would over-fit to the eval set.
