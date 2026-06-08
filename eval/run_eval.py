@@ -1,5 +1,31 @@
-"""Runs the evaluation harness over the question set and computes accuracy and trust metrics."""
+"""Evaluation harness: scores the trust layer using agent_correct as the oracle for 'should fire'.
 
+Scoring methodology
+-------------------
+The trust layer's job is to catch WRONG answers and stay quiet on CORRECT ones. So the ground
+truth for "should the trust layer have fired?" is whether the agent's answer was actually wrong
+on THIS run — NOT which bucket the question belongs to. The agent is non-deterministic: it
+sometimes gets a trap right (nothing to catch) and sometimes gets a clean question wrong
+(should be caught). Using the bucket as the oracle contaminates the metrics; we use
+agent_correct instead.
+
+  agent_correct False + verdict != ANSWER  -> TP  (caught a real error)
+  agent_correct False + verdict == ANSWER  -> FN  (MISSED a real error — the dangerous case)
+  agent_correct True  + verdict == ANSWER  -> TN  (correctly passed a correct query)
+  agent_correct True  + verdict != ANSWER  -> FP  (false alarm on a correct query)
+
+bucket / trap_type are kept purely as REPORTING categories (recall broken down by error type).
+known_limitation questions are reported separately and excluded from headline metrics.
+
+Manual confirmation
+-------------------
+Questions with descriptive / multi-row ground truth cannot be auto-scored. Each run is cached
+to last_run.json; descriptive cases are marked PENDING until a human confirms agent_correct via
+MANUAL_OVERRIDES, after which `--rescore` re-scores the SAME cached run (no agent re-invocation,
+so the confirmed judgment stays valid despite agent non-determinism).
+"""
+
+import json
 import sys
 from pathlib import Path
 
@@ -8,13 +34,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from agent.graph import ANSWER, build_graph, load_schema  # noqa: E402
 from eval.questions import QUESTIONS  # noqa: E402
 
-# Relative tolerance for numeric ground-truth comparison.
-# Kept tight enough that the q3 wrong-grain error (154.10 vs 160.99 = 4.3%) is NOT a match.
 REL_TOL = 0.02
+CACHE = Path(__file__).parent / "last_run.json"
 
+# Human-confirmed agent_correct for descriptive / multi-row questions, keyed by id.
+# Filled in after reviewing the cached run's agent output (see the PENDING section).
+MANUAL_OVERRIDES: dict[str, bool] = {
+    "t3": False,  # agent total $20.3M is fan-out inflated (clean ~$16.0M)
+    "t4": True,   # correct grain, no fan-out; price+freight is a valid reading of "revenue"
+    "t7": False,  # COUNT(order_id)=11,115 overcounts vs correct COUNT(DISTINCT)=9,417
+    "c2": True,   # payment-type breakdown matches ground truth exactly
+}
+
+
+# --------------------------------------------------------------------------- #
+# Scoring helpers                                                             #
+# --------------------------------------------------------------------------- #
 
 def extract_scalar(result):
-    """Pull a single numeric value from a DB result row-list, or None."""
     if isinstance(result, list) and result:
         first = result[0]
         if isinstance(first, (list, tuple)) and first:
@@ -33,137 +70,194 @@ def numeric_match(agent_val, gt, rel_tol=REL_TOL):
     return abs(agent_val - float(gt)) / denom <= rel_tol
 
 
+def summarize(result):
+    """Compact, JSON-serializable summary used to judge multi-row results manually."""
+    out = {"n_rows": 0, "grand_total": None, "top_row": None, "preview": []}
+    if isinstance(result, list) and result:
+        out["n_rows"] = len(result)
+        out["preview"] = [list(r) for r in result[:8]]
+        numeric_last = [r[-1] for r in result if isinstance(r[-1], (int, float))]
+        if numeric_last:
+            out["grand_total"] = float(sum(numeric_last))
+            out["top_row"] = list(
+                max(result, key=lambda r: r[-1] if isinstance(r[-1], (int, float)) else float("-inf"))
+            )
+    return out
+
+
 def classify(agent_correct, trust_caught):
-    """Confusion matrix. agent_correct=None means manual review needed."""
+    """agent_correct is the oracle. None = manual judgment pending."""
     if agent_correct is None:
-        return "MANUAL"
+        return "PENDING"
     if not agent_correct and trust_caught:
-        return "TP"   # wrong + caught
+        return "TP"
     if not agent_correct and not trust_caught:
-        return "FN"   # wrong + missed
+        return "FN"
     if agent_correct and not trust_caught:
-        return "TN"   # right + passed
-    return "FP"       # right + flagged
+        return "TN"
+    return "FP"
 
 
-def run():
+# --------------------------------------------------------------------------- #
+# Run (invokes the agent) and cache                                          #
+# --------------------------------------------------------------------------- #
+
+def run_and_cache():
     schema_text = load_schema()
     app = build_graph()
-    rows_out = []
+    rows = []
 
     for q in QUESTIONS:
         state = app.invoke({
-            "question":     q["question"],
-            "schema_text":  schema_text,
-            "sql":          "",
-            "result":       [],
-            "answer":       "",
-            "error":        None,
-            "trust_checks": [],
-            "verdict":      ANSWER,
-            "confidence":   1.0,
-            "reasoning":    "",
+            "question": q["question"], "schema_text": schema_text, "sql": "",
+            "result": [], "answer": "", "error": None, "trust_checks": [],
+            "verdict": ANSWER, "confidence": 1.0, "reasoning": "",
+        })
+        result = state["result"]
+        rows.append({
+            "id": q["id"], "bucket": q["bucket"], "trap_type": q["trap_type"],
+            "question": q["question"], "ground_truth": q["ground_truth"],
+            "sql": state["sql"], "verdict": state["verdict"],
+            "confidence": state["confidence"], "trust_caught": state["verdict"] != ANSWER,
+            "fired": sorted({c["method"] for c in state.get("trust_checks", []) if c.get("flagged")}),
+            "agent_val": extract_scalar(result),
+            "summary": summarize(result),
+            "error": state.get("error"),
         })
 
-        sql        = state["sql"]
-        result     = state["result"]
-        verdict    = state["verdict"]
-        confidence = state["confidence"]
-        checks     = state.get("trust_checks", [])
-        error      = state.get("error")
+    CACHE.write_text(json.dumps(rows, indent=2, default=str))
+    return rows
 
-        gt = q["ground_truth"]
-        agent_val = extract_scalar(result)
 
+def load_cache():
+    return json.loads(CACHE.read_text())
+
+
+# --------------------------------------------------------------------------- #
+# Scoring + reporting                                                        #
+# --------------------------------------------------------------------------- #
+
+def score(rows):
+    for r in rows:
+        gt = r["ground_truth"]
         if isinstance(gt, (int, float)):
-            agent_correct = numeric_match(agent_val, gt)
-            agent_disp = "yes" if agent_correct else "no"
+            r["agent_correct"] = numeric_match(r["agent_val"], gt)
         else:
-            agent_correct = None          # descriptive → manual
-            agent_disp = "manual"
-
-        trust_caught = verdict != ANSWER
-        cls = classify(agent_correct, trust_caught)
-        fired = sorted({c["method"] for c in checks if c.get("flagged")})
-
-        rows_out.append({
-            "id": q["id"],
-            "is_trap": q["is_trap"],
-            "trap_type": q["trap_type"],
-            "ground_truth": gt,
-            "agent_val": agent_val,
-            "agent_correct": agent_disp,
-            "verdict": verdict,
-            "confidence": confidence,
-            "classification": cls,
-            "fired": fired,
-            "sql": sql,
-            "n_rows": len(result) if isinstance(result, list) else 1,
-            "error": error,
-        })
-
-    return rows_out
+            r["agent_correct"] = MANUAL_OVERRIDES.get(r["id"], None)
+        r["classification"] = classify(r["agent_correct"], r["trust_caught"])
+    return rows
 
 
-def report(rows_out):
-    # ---- Per-question detail ----
-    print("\n" + "=" * 78)
-    print("PER-QUESTION DETAIL")
-    print("=" * 78)
-    for r in rows_out:
-        print(f"\n[{r['id']}] trap={r['is_trap']} ({r['trap_type'] or 'none'})")
-        print(f"  SQL: {' '.join(r['sql'].split())[:100]}")
-        print(f"  ground_truth: {r['ground_truth']}")
-        print(f"  agent_value:  {r['agent_val']}  ({r['n_rows']} row(s))")
-        if r["error"]:
-            print(f"  SQL ERROR: {r['error']}")
-        print(f"  verdict: {r['verdict']} (conf {r['confidence']})  |  agent_correct: {r['agent_correct']}")
-        print(f"  checks fired: {r['fired'] or '(none)'}")
-        print(f"  >> classification: {r['classification']}")
+def _ac_disp(ac):
+    return {True: "yes", False: "no", None: "PENDING"}[ac]
 
-    # ---- Summary table ----
-    print("\n" + "=" * 78)
-    print("SUMMARY TABLE")
-    print("=" * 78)
-    hdr = f"{'id':<4} {'is_trap':<8} {'agent_correct':<14} {'verdict':<9} {'class':<7} fired"
-    print(hdr)
-    print("-" * 78)
-    for r in rows_out:
-        print(
-            f"{r['id']:<4} {str(r['is_trap']):<8} {r['agent_correct']:<14} "
-            f"{r['verdict']:<9} {r['classification']:<7} {','.join(r['fired'])}"
-        )
 
-    # ---- Metrics ----
-    counts = {"TP": 0, "FN": 0, "TN": 0, "FP": 0, "MANUAL": 0}
-    for r in rows_out:
-        counts[r["classification"]] += 1
+def report(rows):
+    score(rows)
 
-    tp, fn, tn, fp = counts["TP"], counts["FN"], counts["TN"], counts["FP"]
-    auto_total = tp + fn + tn + fp
-    agent_correct_n = tn + fp                       # agent was right
-    agent_acc = agent_correct_n / auto_total if auto_total else 0.0
+    # 1. Per-question table -------------------------------------------------- #
+    print("\n" + "=" * 96)
+    print("1. PER-QUESTION DETAIL  (agent_correct is the scoring oracle)")
+    print("=" * 96)
+    print(f"{'id':<4} {'bucket':<16} {'trap_type':<20} {'agent_correct':<13} {'verdict':<9} {'class':<8} fired")
+    print("-" * 96)
+    for r in rows:
+        print(f"{r['id']:<4} {r['bucket']:<16} {str(r['trap_type'] or '-'):<20} "
+              f"{_ac_disp(r['agent_correct']):<13} {r['verdict']:<9} {r['classification']:<8} "
+              f"{','.join(r['fired'])}")
+
+    # PENDING evidence ------------------------------------------------------- #
+    pending = [r for r in rows if r["classification"] == "PENDING"]
+    if pending:
+        print("\n" + "-" * 96)
+        print("PENDING MANUAL CONFIRMATION — review agent output vs ground truth, then fill MANUAL_OVERRIDES:")
+        print("-" * 96)
+        for r in pending:
+            s = r["summary"]
+            print(f"\n  [{r['id']}] {r['question']}")
+            print(f"     ground_truth: {r['ground_truth']}")
+            print(f"     agent SQL:    {' '.join(r['sql'].split())[:110]}")
+            print(f"     n_rows={s['n_rows']}  grand_total={s['grand_total']}  top_row={s['top_row']}")
+            print(f"     verdict={r['verdict']}  fired={r['fired'] or '(none)'}")
+
+    # 2. Headline metrics ---------------------------------------------------- #
+    headline = [r for r in rows
+                if r["bucket"] != "known_limitation" and r["classification"] in ("TP", "FN", "TN", "FP")]
+    tp = sum(r["classification"] == "TP" for r in headline)
+    fn = sum(r["classification"] == "FN" for r in headline)
+    tn = sum(r["classification"] == "TN" for r in headline)
+    fp = sum(r["classification"] == "FP" for r in headline)
     recall = tp / (tp + fn) if (tp + fn) else float("nan")
     fpr = fp / (fp + tn) if (fp + tn) else float("nan")
+    scored = tp + fn + tn + fp
+    agent_correct_n = tn + fp
+    n_pending = sum(r["classification"] == "PENDING" for r in rows if r["bucket"] != "known_limitation")
 
-    print("\n" + "=" * 78)
-    print("SUMMARY METRICS")
-    print("=" * 78)
-    print(f"  Class counts: TP={tp}  FN={fn}  TN={tn}  FP={fp}  MANUAL={counts['MANUAL']}")
-    print(f"  Auto-verifiable questions: {auto_total}  (manual review: {counts['MANUAL']})")
-    print(f"  Agent accuracy (auto):     {agent_acc:.0%}  ({agent_correct_n}/{auto_total})")
-    print(f"  Trust-layer recall:        {recall:.0%}  (TP/(TP+FN) = {tp}/{tp + fn})"
-          if (tp + fn) else "  Trust-layer recall:        n/a (no positive cases)")
-    print(f"  False-positive rate:       {fpr:.0%}  (FP/(FP+TN) = {fp}/{fp + tn})"
-          if (fp + tn) else "  False-positive rate:       n/a (no negative cases)")
+    print("\n" + "=" * 96)
+    print("2. HEADLINE METRICS  (oracle = agent_correct; known_limitation excluded)")
+    print("=" * 96)
+    print(f"  Confusion counts:    TP={tp}  FN={fn}  TN={tn}  FP={fp}   (scored={scored}, pending={n_pending})")
+    print(f"  Trust-layer recall:  {recall:.0%}   (TP/(TP+FN) = {tp}/{tp + fn})   "
+          f"<- fraction of REAL agent errors caught")
+    print(f"  False-positive rate: {fpr:.0%}   (FP/(FP+TN) = {fp}/{fp + tn})   "
+          f"<- fraction of CORRECT answers wrongly flagged")
+    print(f"  Agent accuracy:      {agent_correct_n}/{scored} correct on scored questions")
 
-    if counts["MANUAL"]:
-        print("\n  MANUAL REVIEW NEEDED (descriptive ground truth):")
-        for r in rows_out:
-            if r["classification"] == "MANUAL":
-                print(f"    [{r['id']}] verdict={r['verdict']}  trap={r['is_trap']}  "
-                      f"gt={r['ground_truth']}")
+    # 3. Recall by error type ------------------------------------------------ #
+    print("\n" + "=" * 96)
+    print("3. BREAKDOWN BY BUCKET / ERROR TYPE  (reporting only — not the oracle)")
+    print("=" * 96)
+    print(f"  {'bucket':<16} {'trap_type':<20} {'TP':>3} {'FN':>3} {'TN':>3} {'FP':>3} {'PEND':>5}  recall")
+    print("  " + "-" * 78)
+    seen = []
+    for r in rows:
+        key = (r["bucket"], r["trap_type"])
+        if key in seen:
+            continue
+        seen.append(key)
+        grp = [x for x in rows if (x["bucket"], x["trap_type"]) == key]
+        g_tp = sum(x["classification"] == "TP" for x in grp)
+        g_fn = sum(x["classification"] == "FN" for x in grp)
+        g_tn = sum(x["classification"] == "TN" for x in grp)
+        g_fp = sum(x["classification"] == "FP" for x in grp)
+        g_pd = sum(x["classification"] == "PENDING" for x in grp)
+        rec = f"{g_tp / (g_tp + g_fn):.0%}" if (g_tp + g_fn) else "  -"
+        print(f"  {r['bucket']:<16} {str(r['trap_type'] or '-'):<20} "
+              f"{g_tp:>3} {g_fn:>3} {g_tn:>3} {g_fp:>3} {g_pd:>5}  {rec}")
+
+    # 4. Known-limitation report -------------------------------------------- #
+    known = [r for r in rows if r["bucket"] == "known_limitation"]
+    print("\n" + "=" * 96)
+    print("4. KNOWN-LIMITATION REPORT  (documented boundary cases — excluded from headline)")
+    print("=" * 96)
+    for r in known:
+        ac = r["agent_correct"]
+        print(f"\n  [{r['id']}] {r['trap_type']}")
+        print(f"     agent wrong: {'yes' if ac is False else ('manual' if ac is None else 'no')}"
+              f"   (agent_value={r['agent_val']}, ground_truth={r['ground_truth']})")
+        print(f"     caught:      {'yes' if r['trust_caught'] else 'NO'}   "
+              f"(verdict={r['verdict']}, fired={r['fired'] or '(none)'})")
+        if ac is False and not r["trust_caught"]:
+            print("     >> CONFIRMED BOUNDARY: agent wrong, trust layer did not catch — as documented.")
+
+    # 5. Detector comparison ------------------------------------------------- #
+    print("\n" + "=" * 96)
+    print("5. DETECTOR FIRING ON CAUGHT ERRORS  (AST vs reexec vs semantic)")
+    print("=" * 96)
+    for r in rows:
+        if r["classification"] == "TP":
+            print(f"  {r['id']:<4} {str(r['trap_type'] or '-'):<20} "
+                  f"ast={'Y' if 'ast' in r['fired'] else '-'}  "
+                  f"reexec={'Y' if 'reexec' in r['fired'] else '-'}  "
+                  f"judge={'Y' if 'llm_judge' in r['fired'] else '-'}  "
+                  f"consensus={'Y' if 'consensus' in r['fired'] else '-'}  all={r['fired']}")
 
 
 if __name__ == "__main__":
-    report(run())
+    if "--rescore" in sys.argv:
+        if not CACHE.exists():
+            sys.exit("No cached run found — run without --rescore first.")
+        print(f"[rescore] loading cached run from {CACHE.name} (no agent re-invocation)")
+        report(load_cache())
+    else:
+        report(run_and_cache())

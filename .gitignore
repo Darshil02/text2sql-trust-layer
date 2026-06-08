@@ -15,6 +15,9 @@ wheels/
 # Local Claude Code settings (personal permissions)
 .claude/settings.local.json
 
+# Eval run cache (per-run artifact)
+eval/last_run.json
+
 # Project-specific
 *.duckdb
 chroma_db/
