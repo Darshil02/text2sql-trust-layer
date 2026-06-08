@@ -19,10 +19,20 @@ ABSTAIN = "ABSTAIN"  # hard failure — refuse to answer
 _HARD_PENALTY = 0.4
 _SOFT_PENALTY = 0.1
 
-# Methods that always produce a HARD flag when flagged=True
+# HARD flags (empirically CONFIRMED problems) -> ABSTAIN.
+#   structural: a referenced table/column does not exist in the schema.
+#   reexec:     re-execution measured actual numeric divergence from a grain-corrected
+#               baseline — fan-out inflation is observed, not merely possible.
+#   consensus:  an independent model re-derived a materially different answer.
 _HARD_METHODS = {"structural", "reexec", "consensus"}
 
-# Methods that always produce a SOFT flag when flagged=True
+# SOFT flags (ADVISORY — possible but unconfirmed) -> FLAG (answer with caveat).
+#   ast:      structural fan-out *suspicion* only. AST cannot distinguish a legitimate
+#             1:N aggregation (e.g. revenue per seller over order_items) from real
+#             fan-out without re-execution; reexec is the empirical confirmer. An AST
+#             flag alone therefore warrants a caveat, not a refusal.
+#   temporal: question looks time-scoped but no DATE/TIMESTAMP predicate was found.
+#   status:   aggregate over a low-cardinality status column with no filter.
 _SOFT_METHODS = {"ast", "temporal", "status"}
 
 # "llm_judge" severity is carried in the check's own "severity" field

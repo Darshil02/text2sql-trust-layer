@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agent.graph import ANSWER, build_graph, load_schema  # noqa: E402
+from agent.graph import ABSTAIN, ANSWER, FLAG, build_graph, load_schema  # noqa: E402
 from eval.questions import QUESTIONS  # noqa: E402
 
 REL_TOL = 0.02
@@ -200,7 +200,18 @@ def report(rows):
     print(f"  Trust-layer recall:  {recall:.0%}   (TP/(TP+FN) = {tp}/{tp + fn})   "
           f"<- fraction of REAL agent errors caught")
     print(f"  False-positive rate: {fpr:.0%}   (FP/(FP+TN) = {fp}/{fp + tn})   "
-          f"<- fraction of CORRECT answers wrongly flagged")
+          f"<- fraction of CORRECT answers flagged in ANY way")
+
+    # Split the FP rate by severity: a hard ABSTAIN refuses a correct answer (costly);
+    # a soft FLAG answers it with a caveat (tolerable). ast (advisory) -> FLAG; reexec
+    # (confirmed) -> ABSTAIN, so this split shows whether confirmed-only gating helps.
+    hard_fp = sum(1 for r in headline if r["classification"] == "FP" and r["verdict"] == ABSTAIN)
+    soft_fp = sum(1 for r in headline if r["classification"] == "FP" and r["verdict"] == FLAG)
+    denom = fp + tn
+    hard_fpr = hard_fp / denom if denom else float("nan")
+    soft_fpr = soft_fp / denom if denom else float("nan")
+    print(f"    - hard FPR (false ABSTAIN — REFUSED a correct answer): {hard_fpr:.0%}  ({hard_fp}/{denom})")
+    print(f"    - soft FPR (false FLAG — caveated a correct answer):   {soft_fpr:.0%}  ({soft_fp}/{denom})")
     print(f"  Agent accuracy:      {agent_correct_n}/{scored} correct on scored questions")
 
     # 3. Recall by error type ------------------------------------------------ #
