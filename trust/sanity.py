@@ -201,8 +201,8 @@ def detect_fanout_reexec(sql: str, con) -> dict[str, Any]:
         if not join_pairs or not agg_cols:
             return {"flagged": False, "reason": "no joins or aggregates to check", "method": "reexec"}
 
-        # Find SUM/AVG columns that land on a many-side table, and record the join key
-        candidates: list[tuple[str, str, str, str]] = []  # (alias, real_table, join_key_col, agg_col)
+        # Map each many-side alias to its (real_table, join_key) for this query.
+        many_info: dict[str, tuple[str, str]] = {}
         for al_a, col_a, al_b, col_b in join_pairs:
             tbl_a = alias_to_table.get(al_a)
             tbl_b = alias_to_table.get(al_b)
@@ -212,22 +212,41 @@ def detect_fanout_reexec(sql: str, con) -> dict[str, Any]:
                 card = get_join_cardinality(con, tbl_a, col_a, tbl_b, col_b)
             except Exception:
                 continue
-            for func, t_alias, agg_col in agg_cols:
-                if func not in ("SUM", "AVG"):
-                    continue
-                if card["b_is_many"] and t_alias == al_b:
-                    candidates.append((al_b, tbl_b, col_b, agg_col))
-                if card["a_is_many"] and t_alias == al_a:
-                    candidates.append((al_a, tbl_a, col_a, agg_col))
+            if card["a_is_many"]:
+                many_info[al_a] = (tbl_a, col_a)
+            if card["b_is_many"]:
+                many_info[al_b] = (tbl_b, col_b)
 
-        if not candidates:
+        # Find the first SUM/AVG node whose expression references a many-side table, and
+        # capture its FULL inner expression. This handles compound aggregates such as
+        # SUM(price + freight_value): the baseline must re-sum the whole expression, not
+        # just its first column (the latter manufactures phantom inflation).
+        target: tuple[str, str, str] | None = None  # (many_table, join_key, inner_expr_sql)
+        for agg_cls in (exp.Sum, exp.Avg):
+            for node in select.find_all(agg_cls):
+                touched = {c.table for c in node.find_all(exp.Column) if c.table in many_info}
+                if not touched:
+                    continue
+                m_alias = sorted(touched)[0]
+                many_table, join_key = many_info[m_alias]
+                # Rewrite alias.col -> col so the expression is valid against the
+                # single many-side table in the baseline subquery.
+                inner = node.this.copy()
+                for c in inner.find_all(exp.Column):
+                    c.set("table", None)
+                target = (many_table, join_key, inner.sql(dialect="duckdb"))
+                break
+            if target:
+                break
+
+        if target is None:
             return {
                 "flagged": False,
                 "reason": "no SUM/AVG on a many-side table found — could not verify",
                 "method": "reexec",
             }
 
-        _, many_table, join_key, agg_col = candidates[0]
+        many_table, join_key, inner_sql = target
 
         # Run the original query and sum all values at the aggregate column position
         orig_rows = con.execute(sql).fetchall()
@@ -239,11 +258,12 @@ def detect_fanout_reexec(sql: str, con) -> dict[str, Any]:
             float(row[agg_idx]) for row in orig_rows if row[agg_idx] is not None
         )
 
-        # Grain-corrected baseline: pre-aggregate many-side table to join-key grain, then SUM.
-        # SUM(SUM(col) GROUP BY join_key) == SUM(col) but makes the grain explicit.
+        # Grain-corrected baseline: pre-aggregate the many-side table to join-key grain
+        # using the SAME inner expression, then sum. SUM(SUM(expr) GROUP BY key) == SUM(expr),
+        # but makes the grain explicit and is free of join fan-out.
         clean_sql = (
-            f'SELECT SUM(_g."{agg_col}") FROM '
-            f'(SELECT "{join_key}", SUM("{agg_col}") AS "{agg_col}" '
+            f'SELECT SUM(_g.agg_val) FROM '
+            f'(SELECT "{join_key}", SUM({inner_sql}) AS agg_val '
             f'FROM "{many_table}" GROUP BY "{join_key}") AS _g'
         )
         clean_row = con.execute(clean_sql).fetchone()
