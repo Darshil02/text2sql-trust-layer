@@ -2,6 +2,8 @@
 
 **A verification layer for LLM-generated SQL that decides when to answer, flag, or abstain — catching silent errors (fan-out double-counts, wrong-grain aggregations, hallucinated columns) that run without error but return confidently wrong numbers.**
 
+**🔗 [Live demo](https://text2sql-trust-layer.streamlit.app/)** — watch the trust layer catch a silently-wrong SQL answer in real time.
+
 ---
 
 ## The problem
